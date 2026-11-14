@@ -11,8 +11,11 @@ IMG_URL="${1:?usage: register.sh <https-url-to-qcow2> <distro> [version]}"
 DISTRO="${2:?}"
 # default release number from the VERSION file — same source as CI and the Makefile
 VERSION="${3:-$(tr -d '[:space:]' < "$HERE/VERSION")}"
-NAME="$(yq -r '.name' "$HERE/distros/${DISTRO}.yaml")"
-TEMPLATE_NAME="Template ${NAME} v${VERSION}"
+M="$HERE/distros/${DISTRO}.yaml"
+if [ ! -f "$M" ] && [ -n "${CSF_LOCAL_DISTROS:-}" ]; then M="$CSF_LOCAL_DISTROS/${DISTRO}.yaml"; fi
+NAME="$(yq -r '.name' "$M")"
+PREFIX="${CSF_TEMPLATE_PREFIX-Template}"
+TEMPLATE_NAME="${PREFIX:+$PREFIX }${NAME} v${VERSION}"
 
 : "${CS_OSTYPEID:?set CS_OSTYPEID (OS type id in CloudStack)}"
 : "${CS_ZONEID:?set CS_ZONEID}"

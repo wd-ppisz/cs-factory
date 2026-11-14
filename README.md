@@ -10,6 +10,39 @@ validation gate and a real boot test.
 Each template is named `Template <Distro> <Version> v<X.Y>`, e.g.
 `Template Debian 13 v1.2`.
 
+Operators work in a **web GUI**: build a template, follow its log, add a new
+distribution with a form, register finished templates in CloudStack and run a
+live test - no YAML, git or SSH.
+
+## Quick start (Docker Compose)
+
+On a Linux host with KVM and Docker Compose v2.23.1+:
+
+```sh
+sudo mkdir -p /opt/cs-factory && cd /opt/cs-factory
+sudo curl -fsSLO https://raw.githubusercontent.com/wd-ppisz/cs-factory/v1.0.0/docker-compose.yml
+sudo curl -fsSL -o .env https://raw.githubusercontent.com/wd-ppisz/cs-factory/v1.0.0/.env.example
+sudo chmod 600 .env
+sudo install -d -o 10001 -g 10001 data/work data/artifacts
+sudo nano .env      # KVM_GID, FLASK_SECRET, FACTORY_ADMIN_PASSWORD, EXTERNAL_URL, ARTIFACTS_BASE_URL
+sudo docker compose up -d
+```
+
+Then open `EXTERNAL_URL`, sign in as `admin` and build `debian-13`.
+The full step-by-step guide is **[docs/installation.md](docs/installation.md)**.
+
+## Documentation
+
+- [Installation](docs/installation.md) - Docker Compose, step by step
+- [Using the GUI](docs/gui-guide.md) - every screen and typical tasks
+- [Configuration](docs/configuration.md) - all settings
+- [CloudStack prerequisites](docs/cloudstack.md) - API account, SSVM access, account settings
+- [Troubleshooting](docs/troubleshooting.md)
+- [Changelog](CHANGELOG.md)
+
+The rest of this README describes what the factory puts into templates, how it
+tests them, and how to run it directly on a host (without Docker).
+
 ## What ends up in a template
 
 Every template gets the same **common layer**, regardless of distribution:
@@ -179,15 +212,21 @@ Disable with `CSF_INSPECT_CHANNEL=off ./register.sh ...`.
 
 - add a distribution with a form-based wizard (no YAML) that validates the
   content - image and checksum file reachable, an entry for the image in the
-  checksums, mandatory packages present - and commits the manifest to the
-  GitLab repository through the API;
-- build a template locally with a live log, and run the tier-3 test;
-- watch CI pipelines and job logs live;
+  checksums, mandatory packages present - and saves the manifest locally
+  (standalone) or commits it to a GitLab repository through the API;
+- build a template with a live log - the same gate as `make release`: build,
+  offline validation, boot test, publication - and run the tier-3 test;
+- watch GitLab CI pipelines and job logs live (GitLab mode);
 - register finished artifacts in CloudStack (API keys set on the Settings page;
   the secret is never shown back, only a fingerprint).
 
+Screen-by-screen guide: [docs/gui-guide.md](docs/gui-guide.md).
+
 Access is OIDC (any provider) restricted to one group (`REQUIRED_GROUP`, the
-`groups` claim). Install on a Debian host with `gui/install.sh` (systemd unit
+`groups` claim), or a single admin password (`FACTORY_ADMIN_PASSWORD`). The
+recommended deployment is the Docker Compose release
+([docs/installation.md](docs/installation.md)). Alternatively, install
+directly on a Debian host with `gui/install.sh` (systemd unit
 `cs-factory-gui`, gunicorn on `127.0.0.1:8500`, nginx site `cs-factory` that also
 serves `/artifacts/`). Put TLS and network restrictions in front of it.
 `/healthz` is the liveness probe; `/healthz?verbose=1` reports the running

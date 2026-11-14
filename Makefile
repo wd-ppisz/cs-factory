@@ -17,7 +17,7 @@ ARTIFACTS_DIR ?= /srv/cs-factory/artifacts
 lint:
 	shellcheck -S warning build.sh register.sh common/finalize.sh common/bin/csf-firstboot \
 	  common/bin/csf-watchdog e2e/smoke-boot.sh e2e/validate-offline.sh e2e/tier2-cloudstack.sh \
-	  ci/*.sh gui/install.sh
+	  ci/*.sh gui/install.sh docker/*.sh
 	python3 -m py_compile common/bin/cloudcfg-tune.py common/bin/csf-inspect \
 	  e2e/mock-vr/beacon-server.py e2e/qga-probe.py e2e/probe-ds-cloudstack.py e2e/tier3-features.py \
 	  gui/cs.py gui/app.py

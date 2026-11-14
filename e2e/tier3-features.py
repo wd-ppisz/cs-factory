@@ -592,8 +592,11 @@ def sweep(min_age_min=30, only_stamp="", force=False):
 # ---------- main scenario -----------------------------------------------------
 
 def manifest_value(distro, key):
+    # shipped manifest first, then one added from the GUI (CSF_LOCAL_DISTROS)
     m = REPO / "distros" / f"{distro}.yaml"
-    if not m.exists():
+    if not m.exists() and os.environ.get("CSF_LOCAL_DISTROS"):
+        m = Path(os.environ["CSF_LOCAL_DISTROS"]) / f"{distro}.yaml"
+    if not re.match(r"^[a-z0-9][a-z0-9._-]*$", distro) or not m.exists():
         return ""
     for line in m.read_text(encoding="utf-8").splitlines():
         if line.startswith(f"{key}:"):

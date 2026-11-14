@@ -10,6 +10,8 @@
 #   CSF_IMAGE_CACHE          persistent cache directory for upstream source images
 #   CSF_IMAGE_MAX_AGE_DAYS   re-download cached source images older than this (default 90)
 #   CSF_FAIL2BAN_IGNOREIP    replaces the `ignoreip` line of common/fail2ban/jail.local
+#   CSF_TEMPLATE_PREFIX      template name prefix (default "Template"; empty = no prefix)
+#   CSF_LOCAL_DISTROS        extra directory with manifests (added from the GUI)
 #                            (space-separated addresses/CIDRs, e.g. your admin networks)
 set -euo pipefail
 # Without this trap an abort via `set -e` is SILENT, and a silent failure cannot be
@@ -34,8 +36,16 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 DISTRO="${1:?usage: build.sh <distro> [version]   e.g. build.sh debian-13 1.1}"
 VERSION="${2:-1.0}"
+case "$DISTRO" in
+  ""|.*|*[!a-z0-9._-]*) echo "invalid distribution name: '$DISTRO'" >&2; exit 1 ;;
+esac
+# Shipped manifests first; then the directory of manifests added from the GUI in
+# standalone mode (CSF_LOCAL_DISTROS) - a local file never shadows a shipped one.
 M="$HERE/distros/${DISTRO}.yaml"
-[ -f "$M" ] || { echo "manifest not found: $M"; exit 1; }
+if [ ! -f "$M" ] && [ -n "${CSF_LOCAL_DISTROS:-}" ]; then
+  M="$CSF_LOCAL_DISTROS/${DISTRO}.yaml"
+fi
+[ -f "$M" ] || { echo "manifest not found: $DISTRO"; exit 1; }
 
 y() { yq -r "$1" "$M"; }
 NAME="$(y '.name')"
@@ -122,7 +132,10 @@ if [ "$DISK_G" -lt "$FLOOR_G" ]; then
 fi
 PKGS="$(yq -r '.packages | join(" ")' "$M")"
 
-TEMPLATE_NAME="Template ${NAME} v${VERSION}"
+# Name prefix is a site choice ("Template Debian 13 v1.2" by default).
+PREFIX="${CSF_TEMPLATE_PREFIX-Template}"
+case "$PREFIX" in *[!A-Za-z0-9\ ._-]*) echo "!! CSF_TEMPLATE_PREFIX: invalid characters in '$PREFIX'" >&2; exit 1 ;; esac
+TEMPLATE_NAME="${PREFIX:+$PREFIX }${NAME} v${VERSION}"
 SLUG="$(echo "$TEMPLATE_NAME" | tr ' .' '-_' | tr '[:upper:]' '[:lower:]')"
 
 OUT="$HERE/build"; mkdir -p "$OUT"

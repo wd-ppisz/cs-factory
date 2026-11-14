@@ -24,11 +24,13 @@ All site-specific settings (OIDC, GitLab, CloudStack, artifact URL) come from
 the environment (/etc/cs-factory/gui.env). There are no built-in defaults for
 them; missing values are reported in the GUI.
 """
+import hmac
 import html
 import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -68,14 +70,46 @@ GITLAB_BRANCH = os.environ.get("GITLAB_BRANCH", "main")
 # optional commit author e-mail for manifests saved from the GUI; empty = GitLab
 # uses the token owner's identity
 GITLAB_COMMIT_EMAIL = os.environ.get("GITLAB_COMMIT_EMAIL", "")
+# GitLab is OPTIONAL. Without it the factory runs standalone (e.g. the Docker
+# release): the wizard saves manifests to LOCAL_DISTROS and templates are built
+# from the dashboard; the CI view is hidden.
+GITLAB_CONFIGURED = bool(GITLAB_URL and GITLAB_PROJECT and GITLAB_TOKEN)
+
+# Directory for manifests added from the GUI in standalone mode. Shipped
+# manifests (REPO/distros) always win - a local file cannot shadow them.
+LOCAL_DISTROS = Path(os.environ["CSF_LOCAL_DISTROS"]) if os.environ.get("CSF_LOCAL_DISTROS") else None
+
+# Local sign-in with a single admin password - the simple alternative to OIDC
+# (one operator, lab, small team). Ignored when OIDC is configured.
+ADMIN_PASSWORD = os.environ.get("FACTORY_ADMIN_PASSWORD", "")
+
+# Where the operator changes settings and how the service is restarted - differs
+# between the host install (gui.env + systemd) and the Docker release (.env + compose).
+CONFIG_HINT = os.environ.get("FACTORY_CONFIG_HINT", "/etc/cs-factory/gui.env")
+RESTART_HINT = os.environ.get("FACTORY_RESTART_HINT", "restart the cs-factory-gui service")
+# `git pull` before a local build only makes sense on a git checkout (host install).
+GIT_PULL = os.environ.get("FACTORY_GIT_PULL", "1") == "1"
+# Zone to register templates in (by name); empty = the first available zone.
+CS_ZONE = os.environ.get("CS_ZONE", "").strip()
+# Attach the csf-inspect virtio-serial channel at registration (needs account
+# settings in CloudStack, see the docs); "off" registers without it.
+INSPECT_CHANNEL = os.environ.get("CSF_INSPECT_CHANNEL", "on") != "off"
+# Product release shown in the footer (set in the Docker image).
+PRODUCT_RELEASE = os.environ.get("CSF_RELEASE", "")
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32).hex())
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True,
+# Secure cookies whenever the GUI is served over https (the normal case). A lab
+# on plain http (no TLS proxy yet) would otherwise never keep a session - the
+# browser drops Secure cookies on http. FACTORY_COOKIE_SECURE overrides.
+COOKIE_SECURE = os.environ.get(
+    "FACTORY_COOKIE_SECURE", "0" if EXTERNAL_URL.startswith("http://") else "1") == "1"
+app.config.update(SESSION_COOKIE_SECURE=COOKIE_SECURE, SESSION_COOKIE_HTTPONLY=True,
                   SESSION_COOKIE_SAMESITE="Lax")
 
 OIDC_CONFIGURED = bool(OIDC_ISSUER and OIDC_CLIENT_ID and EXTERNAL_URL)
+LOCAL_LOGIN = bool(ADMIN_PASSWORD) and not OIDC_CONFIGURED
 
 oauth = OAuth(app)
 if OIDC_CONFIGURED:
@@ -96,6 +130,8 @@ SHA_RE = re.compile(r"^([0-9a-f]{64}|[0-9a-f]{128})$")
 SIZE_RE = re.compile(r"^[0-9]{1,3}[GM]$")
 PKG_RE = re.compile(r"^[a-z0-9][a-z0-9.+_-]{0,60}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,40}$")
+# CloudStack OS type description, e.g. "Debian GNU/Linux 12 (64-bit)"
+OSTYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()/+,-]{0,80}$")
 
 STD_PACKAGES = ["qemu-guest-agent", "fail2ban", "chrony", "curl", "jq", "python3"]
 
@@ -125,15 +161,21 @@ MUST_HAVE = ("qemu-guest-agent", "fail2ban")
 def missing_config() -> list[str]:
     """Names of site-specific settings that are not configured."""
     out = []
+    oidc = (("OIDC_ISSUER", OIDC_ISSUER), ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
+            ("EXTERNAL_URL", EXTERNAL_URL))
     if not AUTH_DISABLED:
-        for name, val in (("OIDC_ISSUER", OIDC_ISSUER), ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
-                          ("EXTERNAL_URL", EXTERNAL_URL)):
-            if not val:
-                out.append(name)
-    for name, val in (("GITLAB_URL", GITLAB_URL), ("GITLAB_PROJECT", GITLAB_PROJECT),
-                      ("GITLAB_TOKEN", GITLAB_TOKEN), ("ARTIFACTS_BASE_URL", ARTIFACTS_BASE_URL)):
-        if not val:
-            out.append(name)
+        if any(v for _, v in oidc[:2]):
+            # OIDC chosen (partly configured) - name exactly what is missing
+            out += [n for n, v in oidc if not v]
+        elif not ADMIN_PASSWORD:
+            out.append("FACTORY_ADMIN_PASSWORD (or OIDC_ISSUER/OIDC_CLIENT_ID/EXTERNAL_URL)")
+    gitlab_vars = (("GITLAB_URL", GITLAB_URL), ("GITLAB_PROJECT", GITLAB_PROJECT),
+                   ("GITLAB_TOKEN", GITLAB_TOKEN))
+    # GitLab is optional: only a PARTIAL configuration is an error
+    if any(v for _, v in gitlab_vars):
+        out += [n for n, v in gitlab_vars if not v]
+    if not ARTIFACTS_BASE_URL:
+        out.append("ARTIFACTS_BASE_URL")
     if not cs.creds()["api_url"]:
         out.append("CS_API_URL")
     return out
@@ -141,14 +183,33 @@ def missing_config() -> list[str]:
 
 # ---------- helpers --------------------------------------------------------
 
+def _manifest_dirs() -> list[Path]:
+    return [REPO / "distros"] + ([LOCAL_DISTROS] if LOCAL_DISTROS else [])
+
+
+def builtin_manifests() -> set[str]:
+    return {p.stem for p in (REPO / "distros").glob("*.yaml")}
+
+
 def list_manifests() -> list[str]:
-    return sorted(p.stem for p in (REPO / "distros").glob("*.yaml"))
+    return sorted({p.stem for d in _manifest_dirs() if d.is_dir() for p in d.glob("*.yaml")})
+
+
+def manifest_path(distro: str) -> Path | None:
+    """Shipped manifest first, then the local (GUI-added) one - same order as build.sh."""
+    if not SLUG_RE.match(distro):
+        return None
+    for d in _manifest_dirs():
+        p = d / f"{distro}.yaml"
+        if p.is_file():
+            return p
+    return None
 
 
 def manifest_field(distro: str, key: str) -> str:
     """Reads a single field from a manifest (no pyyaml dependency)."""
-    p = REPO / "distros" / f"{distro}.yaml"
-    if not p.exists():
+    p = manifest_path(distro)
+    if not p:
         return ""
     for line in p.read_text(encoding="utf-8").splitlines():
         if line.startswith(f"{key}:"):
@@ -240,6 +301,7 @@ def validate_form(f) -> tuple[dict, list[str]]:
     sums_url = (f.get("sums_url") or "").strip()
     sha = (f.get("sha") or "").strip().lower()
     disk = (f.get("disk_size") or "10G").strip().upper()
+    ostype = (f.get("cs_ostype") or "").strip()
     epel = "true" if f.get("epel") else "false"
     pkgs_raw = (f.get("packages") or "").replace(",", "\n").split("\n")
     pkgs = [p.strip() for p in pkgs_raw if p.strip()] or list(STD_PACKAGES)
@@ -250,6 +312,9 @@ def validate_form(f) -> tuple[dict, list[str]]:
         err.append("The custom- prefix is reserved for one-off builds.")
     if not NAME_RE.match(name):
         err.append("Display name is required (it becomes part of the CloudStack template name).")
+    if ostype and not OSTYPE_RE.match(ostype):
+        err.append("CloudStack OS type: letters, digits, spaces and ._()/+,- only, "
+                   "e.g. Debian GNU/Linux 12 (64-bit).")
     if not SIZE_RE.match(disk):
         err.append("Disk size as number+G/M, e.g. 10G.")
     else:
@@ -272,8 +337,10 @@ def validate_form(f) -> tuple[dict, list[str]]:
         err.append("Checksum: 64 characters (sha256) or 128 (sha512), [0-9a-f] only.")
     if not sha and not sums_url:
         err.append("Provide the checksum file URL (recommended) or enter the checksum manually.")
-    if sums_url and not sums_url.startswith("https://"):
-        err.append("Checksum file URL must be https.")
+    # Same character rules as the image URL: the value is written into the
+    # manifest between quotes - a quote or a line break would inject YAML keys.
+    if sums_url and not re.match(r"^https://[^\s'\"]+$", sums_url):
+        err.append("Checksum file URL must be https, without spaces or quotes.")
 
     # reachability check: the image and the checksum file MUST exist, and the
     # checksums MUST contain an entry for this file - otherwise the build would
@@ -299,7 +366,7 @@ def validate_form(f) -> tuple[dict, list[str]]:
                 err.append(f"Cannot fetch the checksum file: {e}")
 
     return ({"slug": slug, "name": name, "url": url, "sums_url": sums_url, "sha": sha,
-             "disk": disk, "epel": epel, "pkgs": pkgs}, err)
+             "disk": disk, "epel": epel, "pkgs": pkgs, "ostype": ostype}, err)
 
 
 def render_manifest(d: dict, author: str) -> str:
@@ -312,12 +379,53 @@ def render_manifest(d: dict, author: str) -> str:
         lines.append(f'sums_url: "{d["sums_url"]}"')
     if d["sha"]:
         lines.append(f'{"sha512" if len(d["sha"]) == 128 else "sha256"}: "{d["sha"]}"')
+    if d.get("ostype"):
+        # the OS type CloudStack shows for the template (registration needs it)
+        lines.append(f'cs_ostype: "{d["ostype"]}"')
     lines += [f'epel: {d["epel"]}', f'disk_size: "{d["disk"]}"', "packages:"]
     lines += [f"  - {p}" for p in d["pkgs"]]
     return "\n".join(lines) + "\n"
 
 
 # ---------- local build queue ----------------------------------------------
+
+def _find_build_env(distro: str, version: str, since: float) -> Path | None:
+    """The descriptor build.sh wrote for THIS build. Its file name comes from the
+    template display name ("Ubuntu 26.04" -> template-ubuntu-26_04-v1_2.env), NOT
+    from the manifest slug, so it is found by content (DISTRO + VERSION) and age."""
+    best = None
+    for p in BUILDS.glob("*.env"):
+        try:
+            if p.stat().st_mtime < since:
+                continue
+            meta = dict(l.split("=", 1) for l in p.read_text().splitlines() if "=" in l)
+        except OSError:
+            continue
+        if meta.get("DISTRO") == distro and meta.get("VERSION") == version:
+            if best is None or p.stat().st_mtime > best.stat().st_mtime:
+                best = p
+    return best
+
+
+def _publish(envfile: Path, img: Path) -> Path:
+    """Moves a PASSING image and its descriptor into the artifacts directory.
+    Written under a temporary name and renamed, so the artifacts list (and the
+    CloudStack SSVM downloading from it) never sees a half-copied file."""
+    ARTIFACTS.mkdir(parents=True, exist_ok=True)
+    dst = ARTIFACTS / img.name
+    tmp = ARTIFACTS / f".{img.name}.part"
+    shutil.copyfile(img, tmp)
+    tmp.chmod(0o644)
+    os.replace(tmp, dst)
+    meta = [l for l in envfile.read_text().splitlines() if not l.startswith("IMG=")]
+    meta.append(f"IMG={dst}")
+    tmpe = ARTIFACTS / f".{envfile.name}.part"
+    tmpe.write_text("\n".join(meta) + "\n")
+    tmpe.chmod(0o644)
+    os.replace(tmpe, ARTIFACTS / envfile.name)
+    img.unlink(missing_ok=True)   # the working copy is ~1 GB; the artifact is the copy that counts
+    return dst
+
 
 def _run(job: dict) -> None:
     LOGS.mkdir(parents=True, exist_ok=True)
@@ -336,27 +444,27 @@ def _run(job: dict) -> None:
             return subprocess.run(cmd, cwd=REPO, env=env,
                                   stdout=f, stderr=subprocess.STDOUT).returncode
 
-        # The checkout on this host has NO auto-sync (no timer, no cron), so without
-        # this the operator clicks "Build" and gets code from arbitrarily many
-        # commits ago - and the log would not tell. A failed pull does not block
-        # the build, but it must be visible: the built commit goes into the job.
-        job["state"] = "updating repository"
-        if sh(["git", "pull", "--ff-only"]) != 0:
-            f.write("!! git pull failed - building from the local version (see commit below)\n")
+        def note(msg: str) -> None:
+            f.write(msg + "\n")
             f.flush()
-        try:
-            job["commit"] = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO,
-                                           capture_output=True, text=True).stdout.strip()
-        except Exception:  # noqa: BLE001 - missing git must not break the build
-            job["commit"] = "?"
-        f.write(f"# building commit: {job['commit']}\n")
-        f.flush()
+
+        # On a host install the checkout has NO auto-sync (no timer, no cron), so
+        # without this the operator clicks "Build" and gets code from arbitrarily
+        # many commits ago - and the log would not tell. A failed pull does not
+        # block the build, but it must be visible: the built commit goes into the
+        # job. The Docker image carries its code baked in (FACTORY_GIT_PULL=0).
+        if GIT_PULL:
+            job["state"] = "updating repository"
+            if sh(["git", "pull", "--ff-only"]) != 0:
+                note("!! git pull failed - building from the local version (see commit below)")
+        job["commit"] = _code_version(short=True) or "?"
+        note(f"# building code: {job['commit']}")
 
         if job.get("kind") == "e2e":
             # Test on a LIVE machine: deploys a VM from a temporary template, checks
             # the full feature set and cleans up after itself. Run from here, NOT
             # from CI, because a CI job runs as the runner user - and the CloudStack
-            # API keys stay with the `factory` user, not in the code-building environment.
+            # API keys stay with the GUI user, not in the code-building environment.
             job["state"] = "e2e test on a live VM"
             sel = (["--artifact", job["artifact"]] if job.get("artifact")
                    else ["--distro", job["distro"]])
@@ -365,20 +473,36 @@ def _run(job: dict) -> None:
             job["finished"] = time.strftime("%H:%M:%S")
             return
 
+        # The same gate as `make release`: build -> offline validation -> boot
+        # test -> publication. Only an image that passed all of it reaches the
+        # artifacts list (and with it the "Register in CloudStack" button).
+        started = time.time() - 1
         job["state"] = "building image"
         rc = sh(["./build.sh", job["distro"], job["version"]])
+        envfile = img = None
         if rc == 0:
-            job["state"] = "validating"
-            img = ""
-            # NOTE the name: `env` above holds the environment passed to sh();
-            # shadowing it with a path broke validation (TypeError on env=Path)
-            # exactly when the build SUCCEEDED - making PASS unreachable.
-            envfile = BUILDS / f"template-{job['distro']}-v{job['version'].replace('.', '_')}.env"
-            if envfile.exists():
+            envfile = _find_build_env(job["distro"], job["version"], started)
+            if envfile:
                 for line in envfile.read_text().splitlines():
                     if line.startswith("IMG="):
-                        img = line.split("=", 1)[1]
-            rc = sh(["e2e/validate-offline.sh", img]) if img else 1
+                        img = Path(line.split("=", 1)[1])
+            if not (img and img.is_file()):
+                note("!! build.sh finished but its image descriptor (.env) was not found")
+                rc = 1
+        if rc == 0:
+            job["state"] = "validating (offline gate)"
+            rc = sh(["e2e/validate-offline.sh", str(img)])
+        if rc == 0:
+            job["state"] = "boot test"
+            rc = sh(["e2e/smoke-boot.sh", str(img)])
+        if rc == 0:
+            job["state"] = "publishing"
+            try:
+                dst = _publish(envfile, img)
+                note(f"published: {dst}")
+            except OSError as e:
+                note(f"!! publication failed: {e}")
+                rc = 1
         job["state"] = "PASS" if rc == 0 else "FAIL"
         job["finished"] = time.strftime("%H:%M:%S")
 
@@ -429,31 +553,83 @@ provider, then <a href="/logout">log out and try again</a>.</p></div>"""), 403
     return wrap
 
 
-def _oidc_missing_page():
+def _auth_missing_page():
     missing = [n for n, v in (("OIDC_ISSUER", OIDC_ISSUER), ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
                               ("EXTERNAL_URL", EXTERNAL_URL)) if not v]
     return page("Sign-in not configured", f"""<div class=card><h2>Sign-in not configured</h2>
-<div class=err>OIDC login is not configured. Missing: <code>{html.escape(', '.join(missing))}</code>.</div>
-<p class=note>Set these variables in <code>/etc/cs-factory/gui.env</code> and restart the
-<code>cs-factory-gui</code> service.</p></div>""", nav=False), 503
+<div class=err>No sign-in method is configured. Set <code>FACTORY_ADMIN_PASSWORD</code>
+(single admin password) or configure OIDC (missing: <code>{html.escape(', '.join(missing))}</code>).</div>
+<p class=note>Set them in <code>{html.escape(CONFIG_HINT)}</code> and {html.escape(RESTART_HINT)}.</p></div>""",
+                nav=False), 503
+
+
+def _safe_next() -> str:
+    nxt = str(session.pop("next", "/") or "/")
+    # local paths only - never an open redirect to another host
+    return nxt if nxt.startswith("/") and not nxt.startswith("//") and "\\" not in nxt else "/"
+
+
+# Local-login brute-force brake: failures are counted per process (one worker);
+# after LOGIN_MAX_FAILS within LOGIN_WINDOW s further attempts are refused.
+LOGIN_MAX_FAILS, LOGIN_WINDOW = 10, 300
+_login_fails: list[float] = []
+
+
+def _login_form(err: str = "", code: int = 200):
+    e = f"<div class=err>{html.escape(err)}</div>" if err else ""
+    return page("Sign in", f"""<div class=card><h2>Sign in</h2>{e}
+<form method=post action="/login">
+<label>user</label><input name=user value="admin" autocomplete=username>
+<label>password</label><input name=password type=password autocomplete=current-password required autofocus>
+<button style="margin-top:12px">Sign in</button></form>
+<p class=note>Single administrator account (<code>FACTORY_ADMIN_PASSWORD</code>).</p></div>""",
+                nav=False), code
 
 
 @app.get("/login")
 def login():
-    if not OIDC_CONFIGURED:
-        return _oidc_missing_page()
-    return oauth.oidc.authorize_redirect(EXTERNAL_URL + "/callback")
+    if OIDC_CONFIGURED:
+        return oauth.oidc.authorize_redirect(EXTERNAL_URL + "/callback")
+    if LOCAL_LOGIN:
+        return _login_form()
+    return _auth_missing_page()
+
+
+@app.post("/login")
+def login_post():
+    if not LOCAL_LOGIN:
+        return "local sign-in is not enabled", 404
+    now = time.time()
+    with _lock:
+        _login_fails[:] = [x for x in _login_fails if now - x < LOGIN_WINDOW]
+        locked = len(_login_fails) >= LOGIN_MAX_FAILS
+    if locked:
+        return _login_form("Too many failed attempts - wait a few minutes and try again.", 429)
+    user = (request.form.get("user") or "").strip()
+    pw = request.form.get("password") or ""
+    ok = hmac.compare_digest(user.encode(), b"admin") & hmac.compare_digest(
+        pw.encode(), ADMIN_PASSWORD.encode())
+    if not ok:
+        with _lock:
+            _login_fails.append(now)
+        time.sleep(1)
+        print(f"[login] failed local sign-in from {request.remote_addr}", flush=True)
+        return _login_form("Wrong user or password.", 401)
+    nxt = _safe_next()
+    session.clear()   # fresh session on privilege change
+    session["user"] = {"name": "admin", "groups": [REQUIRED_GROUP]}
+    return redirect(nxt)
 
 
 @app.get("/callback")
 def callback():
     if not OIDC_CONFIGURED:
-        return _oidc_missing_page()
+        return _auth_missing_page()
     token = oauth.oidc.authorize_access_token()
     info = token.get("userinfo") or oauth.oidc.userinfo(token=token)
     session["user"] = {"name": info.get("preferred_username") or info.get("email") or "?",
                        "groups": info.get("groups") or info.get("roles") or []}
-    return redirect(session.pop("next", "/"))
+    return redirect(_safe_next())
 
 
 @app.get("/logout")
@@ -513,20 +689,23 @@ def page(title: str, body: str, wide: bool = False, nav: bool = True) -> str:
     u = current_user()
     who = (f'<span class=u>{html.escape(str(u.get("name")))} '
            f'&middot; <a href="/logout">log out</a></span>') if u else ""
-    links = ('<a href="/">dashboard</a><a href="/new">new distribution</a><a href="/ci">CI status</a>'
-             '<a href="/settings">settings</a><a href="/help">help</a>'
+    links = ('<a href="/">dashboard</a><a href="/new">new distribution</a>'
+             + ('<a href="/ci">CI status</a>' if GITLAB_CONFIGURED else '')
+             + '<a href="/settings">settings</a><a href="/help">help</a>'
              '<a href="/artifacts/">artifacts</a>') if nav else ""
     missing = missing_config() if nav else []
     warn = (f'<div class="card span"><div class=banner>Configuration incomplete - missing: '
             f'<code>{html.escape(", ".join(missing))}</code>. Set them in '
-            f'<code>/etc/cs-factory/gui.env</code> and restart the service; the related '
+            f'<code>{html.escape(CONFIG_HINT)}</code> and {html.escape(RESTART_HINT)}; the related '
             f'features stay unavailable until then.</div></div>') if missing else ""
+    foot = (f'<p class=note style="text-align:center">CloudStack Template Factory'
+            f'{" " + html.escape(PRODUCT_RELEASE) if PRODUCT_RELEASE else ""}</p>')
     return f"""<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>{html.escape(title)} - cs-factory</title><style>{CSS}</style>
-<header><h1>cs-factory - CloudStack template factory</h1>
+<title>{html.escape(title)} - CloudStack Template Factory</title><style>{CSS}</style>
+<header><h1>CloudStack Template Factory</h1>
 {links}{who}</header>
-<div class="wrap{' one' if wide else ''}">{warn}{body}</div>"""
+<div class="wrap{' one' if wide else ''}">{warn}{body}</div>{foot}"""
 
 
 @app.get("/")
@@ -570,16 +749,24 @@ enabled and the supervision channel attached.</div>
             """<p class=note>No finished images yet. Build a template (panel above or CI) -
 after a PASS it will appear here with a registration button.</p>""")
 
+    ci_card = ("""<div class="card"><h2>CI status (GitLab)</h2><div id=ci class=note>loading...</div>
+<p class=note><a href="/ci">full live view &rarr;</a></p></div>""" if GITLAB_CONFIGURED else
+               """<div class="card"><h2>Where do templates go?</h2><p class=note>A build that
+passes every check appears below under <b>Finished templates</b>, with a button that
+registers it in CloudStack. The image itself is served under
+<a href="/artifacts/">/artifacts/</a> - CloudStack downloads it from there.</p></div>""")
     return page("Dashboard", f"""
 <div class="card span"><h2>What do you want to do?</h2>
 <div class=row2>
 <div><b>Add a new distribution</b><p class=note>The wizard walks you through a
-form (no YAML), checks it and saves it to the repository -
-CI builds the template automatically.</p><a href="/new"><button>Open the wizard</button></a></div>
+form (no YAML) and checks it before saving{" - CI then builds the template automatically" if GITLAB_CONFIGURED else "; then build it here"}.</p>
+<a href="/new"><button>Open the wizard</button></a></div>
 <div><b>Build a template now (on this host)</b>
+<p class=note style="margin:4px 0 0">Build &rarr; offline validation gate &rarr; boot test &rarr;
+publication. Takes about 10-30 minutes; only a PASS is published.</p>
 <form method=post action="/build">
 <label>distribution</label><select name=distro id=bdistro>{opts}</select>
-<label>template version (goes into the name "Template ... vX.Y")</label>
+<label>template version (goes into the template name "... vX.Y")</label>
 <input name=version value="{release_version()}" pattern="[0-9]+\\.[0-9]+">
 <label>disk size <span class=note>- leave empty to use the manifest value</span></label>
 <input name=disk_size id=bdisk pattern="[0-9]+[GgMm]" placeholder="from manifest">
@@ -587,7 +774,7 @@ CI builds the template automatically.</p><a href="/new"><button>Open the wizard<
 single build only - the manifest in the repository stays unchanged.</p>
 <button style="margin-top:10px">Build locally</button></form></div>
 </div>
-<p class=note style="margin-top:12px">Manifests in the repository: {mlinks}</p></div>
+<p class=note style="margin-top:12px">Available manifests: {mlinks}</p></div>
 
 <div class="card"><h2>Recent local builds</h2>
 <table><tr><th>#</th><th>what</th><th>state</th><th>finished</th><th></th></tr>
@@ -595,8 +782,7 @@ single build only - the manifest in the repository stays unchanged.</p>
 <p class=note>PASS = the template passed the gate and can be registered in CloudStack.
 FAIL = not fit for use (details in the log).</p></div>
 
-<div class="card"><h2>CI status (GitLab)</h2><div id=ci class=note>loading...</div>
-<p class=note><a href="/ci">full live view &rarr;</a></p></div>
+{ci_card}
 
 <div class="card span"><h2>Finished templates - CloudStack registration</h2>
 {arts}</div>
@@ -610,7 +796,7 @@ function refreshDisk(){{
 }}
 document.getElementById('bdistro').addEventListener('change',refreshDisk);
 refreshDisk();
-fetch('/api/ci').then(r=>r.json()).then(d=>{{
+if(document.getElementById('ci'))fetch('/api/ci').then(r=>r.json()).then(d=>{{
   const el=document.getElementById('ci');
   if(d.error){{el.textContent='unavailable: '+d.error;return}}
   el.innerHTML=d.pipelines.slice(0,3).map(p=>
@@ -627,10 +813,12 @@ def new(prefill: dict | None = None, errors: list[str] | None = None, okmsg: str
     errs = ("<div class=err><b>Please fix the following:</b><ul>"
             + "".join(f"<li>{html.escape(e)}</li>" for e in (errors or [])) + "</ul></div>") if errors else ""
     ok = f"<div class=ok>{okmsg}</div>" if okmsg else ""
+    save_note = ("After saving, the manifest lands in the repository and CI builds and "
+                 "checks the template on its own." if GITLAB_CONFIGURED else
+                 "After saving, the distribution appears on the dashboard, where you build it.")
     return page("New distribution", f"""
 <div class="card span"><h2>New distribution wizard</h2>{ok}{errs}
-<div class=banner>Fill in the fields - no YAML or git knowledge needed. After saving,
-the manifest lands in the repository and CI builds and checks the template on its own.
+<div class=banner>Fill in the fields - no YAML or git knowledge needed. {save_note}
 Not sure where to get the URLs? <a href="/help">See the step-by-step help</a>.</div>
 <form method=post action="/new">
 <div class=row2>
@@ -652,6 +840,10 @@ Not sure where to get the URLs? <a href="/help">See the step-by-step help</a>.</
 <input name=disk_size value="{html.escape(d.get('disk','10G'))}" pattern="([1-9][0-9]{{1,2}})G"
  title="Minimum 10G - a smaller disk runs out of space right after the machine starts."></div>
 </div>
+<label>CloudStack OS type (as listed in CloudStack, e.g. <i>Debian GNU/Linux 12 (64-bit)</i>;
+needed to register the template)</label>
+<input name=cs_ostype list=ostypes placeholder="Ubuntu 24.04 LTS" value="{html.escape(d.get('ostype',''))}">
+{_ostype_datalist()}
 <label><input type=checkbox name=epel style="width:auto" {'checked' if d.get('epel')=='true' else ''}>
  RHEL family (Rocky/Alma) - add the EPEL repository</label>
 <label>Packages to install (one per line; suggestion = standard set)</label>
@@ -660,7 +852,7 @@ Not sure where to get the URLs? <a href="/help">See the step-by-step help</a>.</
 they are the supervision and security layer; without them the template will not pass the checks.</p>
 <div style="margin-top:12px;display:flex;gap:10px">
 <button name=action value=check class=ghost>Only check</button>
-<button name=action value=save>Check and save to repository</button></div>
+<button name=action value=save>Check and save</button></div>
 </form></div>""", wide=True)
 
 
@@ -677,6 +869,8 @@ def new_post():
 
     who = str((current_user() or {}).get("name", "?"))
     body = render_manifest(d, who)
+    if not GITLAB_CONFIGURED:
+        return _save_local_manifest(d, body)
     path = urllib.parse.quote(f"distros/{d['slug']}.yaml", safe="")
     payload = {"branch": GITLAB_BRANCH, "content": body,
                "commit_message": f"feat(distros): {d['slug']} - added from the cs-factory GUI by {who}",
@@ -695,10 +889,57 @@ def new_post():
     except Exception as e:  # noqa: BLE001
         return new(prefill=d, errors=[f"Saving to the repository failed: {e}. "
                                       "The manifest was NOT saved - report this to an administrator."])
-    (REPO / "distros" / f"{d['slug']}.yaml").write_text(body)   # visible locally right away
+    try:
+        (REPO / "distros" / f"{d['slug']}.yaml").write_text(body)   # visible locally right away
+    except OSError:
+        pass   # read-only code directory: the next CI deploy brings it
     return new(okmsg=f"Manifest <code>distros/{html.escape(d['slug'])}.yaml</code> {action} "
                      f"in the repository. CI is building the template - "
                      f'<a href="/ci">watch the live status</a>.')
+
+
+def _save_local_manifest(d: dict, body: str):
+    """Standalone mode: the manifest goes to LOCAL_DISTROS (a persistent volume).
+    Shipped manifests cannot be overwritten - they belong to the release."""
+    if not LOCAL_DISTROS:
+        return new(prefill=d, errors=["No GitLab repository and no local manifest directory "
+                                      "(CSF_LOCAL_DISTROS) are configured - nowhere to save."])
+    if d["slug"] in builtin_manifests():
+        return new(prefill=d, errors=[f"'{d['slug']}' is a built-in distribution of this release "
+                                      "and cannot be replaced - choose another technical name "
+                                      f"(e.g. {d['slug']}-custom)."])
+    LOCAL_DISTROS.mkdir(parents=True, exist_ok=True)
+    dst = LOCAL_DISTROS / f"{d['slug']}.yaml"
+    action = "updated" if dst.exists() else "saved"
+    tmp = LOCAL_DISTROS / f".{d['slug']}.yaml.part"
+    tmp.write_text(body, encoding="utf-8")
+    os.replace(tmp, dst)
+    slug = html.escape(d["slug"])
+    return new(okmsg=f"""Distribution <code>{slug}</code> {action}. Build it now:
+<form method=post action="/build" style="display:inline">
+<input type=hidden name=distro value="{slug}">
+<input type=hidden name=version value="{html.escape(release_version())}">
+<button>Build {slug} v{html.escape(release_version())}</button></form>""")
+
+
+_ostype_cache: dict = {"at": 0.0, "html": ""}
+
+
+def _ostype_datalist() -> str:
+    """Suggestions for the OS type field from CloudStack (cached 10 min; empty
+    when CloudStack is not configured or unreachable - the field stays free text)."""
+    if not cs.configured():
+        return ""
+    now = time.time()
+    if now - _ostype_cache["at"] > 600:
+        try:
+            names = sorted({o.get("description", "") for o in cs.os_types()} - {""})
+            _ostype_cache["html"] = ("<datalist id=ostypes>" + "".join(
+                f"<option value=\"{html.escape(n)}\">" for n in names) + "</datalist>")
+        except Exception:  # noqa: BLE001 - suggestions are a convenience only
+            _ostype_cache["html"] = ""
+        _ostype_cache["at"] = now
+    return _ostype_cache["html"]
 
 
 @app.post("/build")
@@ -773,15 +1014,15 @@ def register():
 
     if not ARTIFACTS_BASE_URL:
         return fail("ARTIFACTS_BASE_URL is not configured.",
-                    "Set it in <code>/etc/cs-factory/gui.env</code> to the URL from which "
-                    "the CloudStack secondary storage VM can download artifacts, then restart the service.")
+                    f"Set it in <code>{html.escape(CONFIG_HINT)}</code> to the URL from which "
+                    f"the CloudStack secondary storage VM can download artifacts, then {html.escape(RESTART_HINT)}.")
     if not cs.configured():
         return fail("The GUI has no CloudStack API configuration.",
                     "Set the API URL and keys on the <a href='/settings'>Settings</a> page, or "
-                    "CS_API_URL, CS_API_KEY and CS_SECRET_KEY in <code>/etc/cs-factory/gui.env</code>.")
+                    f"CS_API_URL, CS_API_KEY and CS_SECRET_KEY in <code>{html.escape(CONFIG_HINT)}</code>.")
     if not art["ostype"]:
         return fail(f"Manifest {art['distro']} has no cs_ostype field.",
-                    "Fill in the OS type in the manifest.")
+                    "Open the wizard, enter the CloudStack OS type and save the distribution again.")
     try:
         ostypeid = cs.find_ostype_id(art["ostype"])
         if not ostypeid:
@@ -790,11 +1031,16 @@ def register():
         zones = cs.zones()
         if not zones:
             return fail("CloudStack returned no available zone.")
+        if CS_ZONE:
+            zones = [z for z in zones if z.get("name") == CS_ZONE]
+            if not zones:
+                return fail(f"CloudStack has no available zone named '{CS_ZONE}' (CS_ZONE).",
+                            "Check the zone name in CloudStack or clear CS_ZONE to use the first zone.")
         zoneid = zones[0]["id"]
         url = f"{ARTIFACTS_BASE_URL}/{art['file']}"
         r = cs.register_template(name=art["template_name"], url=url, ostypeid=ostypeid,
                                  zoneid=zoneid, ispublic=ispublic,
-                                 extraconfig=cs.CSF_INSPECT_CHANNEL)
+                                 extraconfig=cs.CSF_INSPECT_CHANNEL if INSPECT_CHANNEL else None)
         tpl = (r.get("template") or [{}])
         tpl = tpl[0] if isinstance(tpl, list) else tpl
     except cs.CSError as e:
@@ -820,9 +1066,9 @@ def register():
 </table>
 <p class=note>CloudStack downloads the image in the background - in its template view
 it first appears as "Not Ready", and once copied to storage as ready to use.</p>
-<p class=note>The template carries the supervision channel <code>org.csfactory.support.0</code>.
+{"""<p class=note>The template carries the supervision channel <code>org.csfactory.support.0</code>.
 Accounts that will create machines from this template must have
-<code>enable.additional.vm.configuration</code> enabled - otherwise the machine will not start.</p>
+<code>enable.additional.vm.configuration</code> enabled - otherwise the machine will not start.</p>""" if INSPECT_CHANNEL else ""}
 <p><a href="/">&larr; back to dashboard</a></p></div>""", wide=True)
 
 
@@ -832,7 +1078,9 @@ def log(jid: int):
     for j in _jobs:
         if j["id"] == jid:
             p = Path(j.get("log", ""))
-            body = html.escape(p.read_text(errors="replace")[-60000:]) if p.exists() else "(empty so far)"
+            raw = p.read_text(errors="replace")[-60000:] if p.exists() else "(empty so far)"
+            # colour codes from the gate scripts are noise in the browser
+            body = html.escape(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw))
             live = j["state"] not in ("PASS", "FAIL") and not str(j["state"]).startswith("ERROR")
             return page(f"Build log #{jid}", f"""
 <div class="card span"><h2>Build #{jid} - {html.escape(j['distro'])} v{j['version']}
@@ -846,13 +1094,15 @@ def log(jid: int):
 @app.get("/manifest/<name>")
 @require_admin
 def manifest(name: str):
-    if not SLUG_RE.match(name) or name not in list_manifests():
+    mp = manifest_path(name)
+    if not mp:
         return "no such manifest", 404
-    body = html.escape((REPO / "distros" / f"{name}.yaml").read_text())
+    body = html.escape(mp.read_text())
+    origin = "built-in (part of this release)" if name in builtin_manifests() else "added from the GUI"
     return page(f"Manifest {name}", f"""<div class="card span">
-<h2>distros/{html.escape(name)}.yaml</h2><div class=feed>{body}</div>
-<p class=note>Changes to existing manifests are made in the repository
-(or via the wizard - it saves a new version of the same file).</p></div>""", wide=True)
+<h2>{html.escape(name)}.yaml &middot; {origin}</h2><div class=feed>{body}</div>
+<p class=note>To change a distribution, open the wizard and save it again under the same
+technical name (built-in distributions are changed in the project repository).</p></div>""", wide=True)
 
 
 # ---------- live CI view ---------------------------------------------------
@@ -860,6 +1110,8 @@ def manifest(name: str):
 @app.get("/api/ci")
 @require_admin
 def api_ci():
+    if not GITLAB_CONFIGURED:
+        return {"error": "GitLab integration is not configured (optional)"}
     try:
         pipes = gitlab("/pipelines?per_page=5")
         out = []
@@ -901,6 +1153,11 @@ def api_job_trace(jid: int):
 @app.get("/ci")
 @require_admin
 def ci():
+    if not GITLAB_CONFIGURED:
+        return page("CI status", """<div class="card span"><h2>CI status</h2>
+<p class=note>The GitLab integration is optional and not configured. Without it,
+templates are built from the <a href="/">dashboard</a>. See the documentation
+("GitLab integration") to connect a GitLab project.</p></div>""", wide=True)
     return page("CI status", """
 <div class="card span"><h2>GitLab pipelines - live</h2>
 <div class=banner>Every manifest change is built here. Green "success" on
@@ -994,15 +1251,15 @@ the file on the server is a working copy, not the source of truth.</p>
 <tr><td>GUI URL</td><td><code>{html.escape(EXTERNAL_URL or '-')}</code></td></tr>
 <tr><td>OIDC issuer</td><td><code>{html.escape(OIDC_ISSUER or '-')}</code></td></tr>
 <tr><td>required group</td><td><code>{html.escape(REQUIRED_GROUP)}</code></td></tr>
-<tr><td>manifest repository</td><td><code>{html.escape(GITLAB_URL or '-')}</code> &middot; project
- {html.escape(GITLAB_PROJECT or '-')} &middot; branch {html.escape(GITLAB_BRANCH)}
- &middot; token {'<span class=y>set</span>' if GITLAB_TOKEN else '<span class=n>missing</span>'}</td></tr>
+<tr><td>sign-in</td><td>{'OIDC' if OIDC_CONFIGURED else ('local admin password' if LOCAL_LOGIN else ('<span class=n>disabled (FACTORY_AUTH_DISABLED)</span>' if AUTH_DISABLED else '<span class=n>not configured</span>'))}</td></tr>
+<tr><td>manifest repository</td><td>{(f"<code>{html.escape(GITLAB_URL)}</code> &middot; project {html.escape(GITLAB_PROJECT)} &middot; branch {html.escape(GITLAB_BRANCH)}") if GITLAB_CONFIGURED else ('standalone - local manifests in <code>' + html.escape(str(LOCAL_DISTROS or '-')) + '</code>')}</td></tr>
+<tr><td>registration zone</td><td>{html.escape(CS_ZONE or 'first available')} &middot; inspection channel {'on' if INSPECT_CHANNEL else 'off'}</td></tr>
 <tr><td>artifacts directory</td><td><code>{html.escape(str(ARTIFACTS))}</code></td></tr>
 <tr><td>artifacts URL for CloudStack</td><td><code>{html.escape(ARTIFACTS_BASE_URL or '-')}</code>
  <span class=note>(the SSVM downloads images from here)</span></td></tr>
 </table>
-<p class=note>An administrator changes these values in <code>/etc/cs-factory/gui.env</code>
-on the factory host (requires a service restart).</p></div>""", wide=True)
+<p class=note>An administrator changes these values in <code>{html.escape(CONFIG_HINT)}</code>
+(then {html.escape(RESTART_HINT)}).</p></div>""", wide=True)
 
 
 @app.post("/settings")
@@ -1073,10 +1330,18 @@ the release number comes from the <code>VERSION</code> file in the repository).<
 <li><b>Click "Only check".</b> The factory checks that the image and the checksum
 file exist, that the checksums contain an entry for this file, and that the package list makes sense.
 If something is wrong you get a concrete message about what to fix.</li>
-<li><b>Click "Check and save to repository".</b> This saves the manifest
-and starts the build in CI. Progress: <a href="/ci">CI status</a>.</li>
-<li><b>Wait for "success" and pick up the template</b> from <a href="/artifacts/">artifacts</a>.
-That URL is what you give CloudStack when registering the template.</li>
+<li><b>Click "Check and save".</b> """ + (
+    """This saves the manifest to the repository and starts the build in CI.
+Progress: <a href="/ci">CI status</a>.</li>
+<li><b>Wait for "success".</b> The template appears on the dashboard under
+<i>Finished templates</i>.</li>""" if GITLAB_CONFIGURED else
+    """The distribution is saved and a <b>Build</b> button appears. Click it (or pick the
+distribution on the <a href="/">dashboard</a>). The build runs through the offline gate and a
+boot test; follow it with the <i>log</i> link.</li>
+<li><b>Wait for PASS.</b> The template appears on the dashboard under
+<i>Finished templates</i>.</li>""") + """
+<li><b>Click "Register in CloudStack".</b> CloudStack downloads the image from
+<a href="/artifacts/">/artifacts/</a> and the template becomes ready a few minutes later.</li>
 </ol>
 <h2 style="margin-top:20px">Good to know</h2>
 <ul>
@@ -1093,16 +1358,27 @@ than 3 months, so templates do not sit on a stale system.</li>
 a quickly deployed machine runs out of space during its first operations, and it looks
 like a system failure rather than a configuration issue. Three places enforce this:
 the wizard, the manifest lint in CI and the check of the finished image.</li>
-<li><b>Local build vs CI</b> - a local build (button on the dashboard) is for a
+""" + ("""<li><b>Local build vs CI</b> - a local build (button on the dashboard) is for a
 quick check of one thing here and now; CI builds all distributions
-after every change and is the source of truth.</li>
+after every change and is the source of truth.</li>""" if GITLAB_CONFIGURED else "") + """
 <li><b>What PASS/FAIL means</b> - after the build the image goes through an automatic
 check (among others: can the password be reset from CloudStack, are SSH host keys
 unique per machine, is supervision enabled). FAIL = such a template is not registered.</li>
 </ul>
-<p class=note>Technical details and design decisions: <code>README.md</code> in the
-project repository.</p></div>""",
+<p class=note>Full documentation: <a href="https://github.com/wd-ppisz/cs-factory/tree/main/docs">docs/</a>
+in the project repository (installation, GUI guide, configuration, troubleshooting).</p></div>""",
                 wide=True)
+
+
+def _code_version(short: bool = False) -> str:
+    """Commit of the code on disk: the git checkout on a host install, or the
+    commit baked into the Docker image (CSF_COMMIT)."""
+    try:
+        v = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True,
+                           text=True, timeout=10, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        v = os.environ.get("CSF_COMMIT", "")
+    return v[:12] if short else v
 
 
 def _commit_at_start() -> str:
@@ -1110,11 +1386,7 @@ def _commit_at_start() -> str:
     underneath the running service (`git pull` before a build), so "what is in
     the repo" does not tell what is running - the CI deploy (ci/factory-deploy.sh)
     compares against THIS value."""
-    try:
-        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True,
-                              text=True, timeout=10, check=True).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return ""
+    return _code_version()
 
 
 RUNNING_COMMIT = _commit_at_start()

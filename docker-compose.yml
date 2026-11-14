@@ -1,0 +1,107 @@
+# CloudStack Template Factory - Docker Compose deployment.
+#
+# Installation guide: docs/installation.md. In short:
+#   cp .env.example .env            # then edit .env
+#   sudo install -d -o 10001 -g 10001 data/work data/artifacts
+#   docker compose up -d
+#
+# Two services:
+#   factory - the GUI and the build toolchain (libguestfs, QEMU/KVM). Unprivileged,
+#             read-only root filesystem, no capabilities; needs /dev/kvm.
+#   web     - nginx in front of it: proxies the GUI and serves finished images
+#             under /artifacts/ (read-only) for the CloudStack SSVM to download.
+#
+# All settings come from .env - nothing in this file needs editing.
+
+name: cs-factory
+
+services:
+  factory:
+    image: ${CSF_IMAGE:-ghcr.io/wd-ppisz/cs-factory:1.0.0}
+    build:
+      context: .
+    restart: unless-stopped
+    init: true
+    # container settings; CSF_ENV_FILE lets a test point at another file
+    env_file: ${CSF_ENV_FILE:-.env}
+    environment:
+      # paths inside the container - fixed; change the HOST paths in .env instead
+      FACTORY_ARTIFACTS: /srv/cs-factory/artifacts
+    devices:
+      - /dev/kvm:/dev/kvm
+    group_add:
+      # group owning /dev/kvm on the host:  stat -c %g /dev/kvm
+      - "${KVM_GID:?set KVM_GID in .env (stat -c %g /dev/kvm)}"
+    volumes:
+      - ${CSF_WORK_DIR:-./data/work}:/srv/cs-factory/work
+      - ${CSF_ARTIFACTS_DIR:-./data/artifacts}:/srv/cs-factory/artifacts
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    expose:
+      - "8500"
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  web:
+    image: ${CSF_WEB_IMAGE:-nginxinc/nginx-unprivileged:1.30.6-alpine}
+    restart: unless-stopped
+    depends_on:
+      factory:
+        condition: service_healthy
+    ports:
+      - "${CSF_HTTP_BIND:-0.0.0.0}:${CSF_HTTP_PORT:-8080}:8080"
+    volumes:
+      - ${CSF_ARTIFACTS_DIR:-./data/artifacts}:/srv/cs-factory/artifacts:ro
+    configs:
+      - source: nginx
+        target: /etc/nginx/conf.d/default.conf
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+configs:
+  nginx:
+    content: |
+      # Generated from docker-compose.yml - edit there.
+      # Behind a TLS reverse proxy, keep its X-Forwarded-Proto; direct access = our scheme.
+      map $$http_x_forwarded_proto $$csf_proto {
+          default $$http_x_forwarded_proto;
+          ""      $$scheme;
+      }
+      server {
+          listen 8080;
+          server_tokens off;
+          client_max_body_size 1m;
+
+          # Finished images (only those that PASSED the build gate). No sign-in:
+          # the CloudStack SSVM downloads from here when a template is registered.
+          # Restrict who can reach this port at the network level.
+          location /artifacts/ {
+              alias /srv/cs-factory/artifacts/;
+              autoindex on;
+              autoindex_exact_size off;
+              default_type application/octet-stream;
+              location ~ /\. { return 404; }
+          }
+
+          location / {
+              proxy_pass http://factory:8500;
+              proxy_set_header Host $$http_host;
+              proxy_set_header X-Forwarded-Host $$http_host;
+              proxy_set_header X-Forwarded-Proto $$csf_proto;
+              proxy_set_header X-Real-IP $$remote_addr;
+              proxy_read_timeout 300s;
+          }
+      }

@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 # build output (images, logs, .env descriptors)
 build/
+# local deployment (docker compose)
+.env
+data/

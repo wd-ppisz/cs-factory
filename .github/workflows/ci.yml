@@ -49,8 +49,8 @@ jobs:
         run: |
           bash -n build.sh register.sh common/finalize.sh common/bin/csf-firstboot \
             common/bin/csf-watchdog e2e/smoke-boot.sh e2e/validate-offline.sh \
-            e2e/tier2-cloudstack.sh ci/factory-deploy.sh gui/install.sh
-          sh -n ci/factory_inventory.sh ci/gen-child.sh
+            e2e/tier2-cloudstack.sh ci/factory-deploy.sh gui/install.sh docker/e2e-compose.sh
+          sh -n ci/factory_inventory.sh ci/gen-child.sh docker/entrypoint.sh
 
       - name: shellcheck
         run: |
@@ -58,14 +58,14 @@ jobs:
           shellcheck --version
           shellcheck -S warning build.sh register.sh common/finalize.sh common/bin/csf-firstboot \
             common/bin/csf-watchdog e2e/smoke-boot.sh e2e/validate-offline.sh e2e/tier2-cloudstack.sh \
-            ci/factory-deploy.sh ci/factory_inventory.sh gui/install.sh
+            ci/factory-deploy.sh ci/factory_inventory.sh gui/install.sh docker/entrypoint.sh docker/e2e-compose.sh
 
       - name: Python syntax
         run: |
           python -m py_compile common/bin/cloudcfg-tune.py common/bin/csf-inspect \
             e2e/mock-vr/beacon-server.py e2e/qga-probe.py e2e/probe-ds-cloudstack.py \
             e2e/tier3-features.py gui/app.py gui/cs.py gui/test_app.py \
-            ci/cve_controller.py ci/test_cve_controller.py
+            ci/cve_controller.py ci/test_cve_controller.py scripts/sync-wiki.py
 
       - name: Manifest lint
         run: |
@@ -94,6 +94,13 @@ jobs:
                | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(#|//)'; then
             echo "the common layer disables automatic apt updates - tenant templates must keep them enabled"; exit 1
           fi
+
+      - name: Compose file
+        run: |
+          cp .env.example .env
+          sed -i 's/^KVM_GID=$/KVM_GID=999/' .env
+          docker compose config --quiet
+          rm .env
 
       - name: CVE controller unit tests
         run: python -m unittest -v ci/test_cve_controller.py

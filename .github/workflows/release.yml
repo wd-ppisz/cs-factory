@@ -1,0 +1,210 @@
+# CloudStack Template Factory - container image: build, scan, end-to-end test,
+# and (on a version tag) publish to GHCR + create the GitHub release.
+#
+#   image  - builds the image from this commit; Trivy scans it (CRITICAL with a
+#            fix available blocks; full report + SBOM are kept as artifacts).
+#   e2e    - runs docker/e2e-compose.sh on a runner with KVM: the Compose stack
+#            exactly as the installation guide sets it up, sign-in, a real
+#            template build from the GUI (build -> offline gate -> boot test ->
+#            publication) and the artifact served under /artifacts/.
+#   publish - only for tags vX.Y.Z: pushes THE SAME image that passed e2e to
+#            ghcr.io/<owner>/cs-factory and creates the GitHub release.
+#
+# TODO pin-by-sha: actions and images are pinned to version tags.
+
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker-compose.yml
+      - .env.example
+      - docker/**
+      - gui/**
+      - build.sh
+      - common/**
+      - distros/**
+      - e2e/**
+      - .github/workflows/release.yml
+  workflow_dispatch:
+    inputs:
+      distro:
+        description: Distribution built by the e2e test
+        default: debian-13
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TRIVY_IMAGE: aquasec/trivy:0.67.0
+  LOCAL_TAG: cs-factory:ci
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    outputs:
+      release: ${{ steps.meta.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4  # TODO pin-by-sha
+        with:
+          persist-credentials: false
+
+      - name: Release name
+        id: meta
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then r="${GITHUB_REF_NAME#v}"; else r="dev-${GITHUB_SHA::12}"; fi
+          echo "release=$r" >> "$GITHUB_OUTPUT"
+          echo "release: $r"
+
+      - name: Build image
+        run: |
+          docker build --pull \
+            --build-arg CSF_RELEASE="${{ steps.meta.outputs.release }}" \
+            --build-arg CSF_COMMIT="${GITHUB_SHA}" \
+            -t "$LOCAL_TAG" .
+          docker image inspect "$LOCAL_TAG" --format 'size: {{.Size}} bytes'
+
+      - name: Trivy image scan
+        run: |
+          trivy() { docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" -w /out "$TRIVY_IMAGE" "$@"; }
+          trivy --version
+          trivy image --skip-version-check --list-all-pkgs --format json --output trivy-image.json "$LOCAL_TAG"
+          trivy image --skip-version-check --format cyclonedx --output sbom.cdx.json "$LOCAL_TAG"
+          # gate: CRITICAL vulnerabilities that already have a fix = rebuild needed
+          trivy image --skip-version-check --scanners vuln --severity CRITICAL --ignore-unfixed \
+            --exit-code 1 --format table "$LOCAL_TAG"
+          # positive control: the report must contain the Debian package inventory,
+          # otherwise "0 findings" would only mean "nothing was scanned"
+          python3 - <<'PY'
+          import json, sys
+          r = json.load(open("trivy-image.json"))
+          os_ = (r.get("Metadata") or {}).get("OS") or {}
+          pk = sum(len(x.get("Packages") or []) for x in r.get("Results") or [])
+          vulns = sum(len(x.get("Vulnerabilities") or []) for x in r.get("Results") or [])
+          print(f"OS={os_.get('Family')} {os_.get('Name')}  results={len(r.get('Results') or [])}  vulns={vulns}")
+          names = {p.get("Name") for x in r.get("Results") or [] for p in x.get("Packages") or []}
+          print(f"packages in the inventory: {pk}")
+          if os_.get("Family") != "debian":
+              sys.exit("POSITIVE CONTROL FAILED: Trivy did not detect the Debian base - the scan is not trustworthy")
+          missing = {"libguestfs0t64", "qemu-system-x86", "python3-flask"} - names
+          if pk < 200 or missing:
+              sys.exit(f"POSITIVE CONTROL FAILED: package inventory incomplete ({pk} packages, missing {sorted(missing)})")
+          PY
+
+      - name: Save image
+        run: docker save "$LOCAL_TAG" | zstd -T0 -3 -o image.tar.zst
+
+      - uses: actions/upload-artifact@v4  # TODO pin-by-sha
+        with:
+          name: image
+          path: image.tar.zst
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4  # TODO pin-by-sha
+        if: always()
+        with:
+          name: image-scan
+          path: |
+            trivy-image.json
+            sbom.cdx.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+  e2e:
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4  # TODO pin-by-sha
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4  # TODO pin-by-sha
+        with:
+          name: image
+
+      - name: Load image
+        run: zstd -dc image.tar.zst | docker load && rm image.tar.zst
+
+      # GitHub-hosted Linux runners expose /dev/kvm, but only to root by default.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0660", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          docker compose version
+
+      - name: End-to-end test (Compose stack, GUI build, artifact)
+        env:
+          CSF_IMAGE: ${{ env.LOCAL_TAG }}
+        run: bash docker/e2e-compose.sh "${{ github.event.inputs.distro || 'debian-13' }}"
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [image, e2e]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4  # TODO pin-by-sha
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4  # TODO pin-by-sha
+        with:
+          name: image
+      - uses: actions/download-artifact@v4  # TODO pin-by-sha
+        with:
+          name: image-scan
+
+      - name: Push the tested image to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ needs.image.outputs.release }}
+        run: |
+          zstd -dc image.tar.zst | docker load
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/cs-factory"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          major_minor="${RELEASE%.*}"
+          for t in "$RELEASE" "$major_minor" latest; do
+            docker tag "$LOCAL_TAG" "$repo:$t"
+            docker push "$repo:$t"
+          done
+          digest=$(docker image inspect "$repo:$RELEASE" --format '{{index .RepoDigests 0}}')
+          echo "pushed: $digest"
+          echo "DIGEST=$digest" >> "$GITHUB_ENV"
+
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ needs.image.outputs.release }}
+        run: |
+          # release notes = this version's section of CHANGELOG.md
+          awk -v v="$RELEASE" '
+            /^## /{ if (on) exit; if (index($0, "[" v "]")) { on=1; next } }
+            on' CHANGELOG.md > notes.md
+          {
+            echo
+            echo "### Container image"
+            echo
+            echo '```'
+            echo "$DIGEST"
+            echo '```'
+            echo
+            echo "Install: see [docs/installation.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/installation.md)."
+          } >> notes.md
+          gh release create "$GITHUB_REF_NAME" --title "CloudStack Template Factory $RELEASE" \
+            --notes-file notes.md docker-compose.yml .env.example sbom.cdx.json trivy-image.json
