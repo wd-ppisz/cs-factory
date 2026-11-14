@@ -103,6 +103,19 @@ while :; do
   [ "$(date +%s)" -lt "$end" ] || { echo "build did not finish within $DEADLINE_MIN min"; exit 1; }
 done
 [ "$state" = PASS ] || { echo "build finished with $state"; exit 1; }
+
+# Positive control: PASS must come from checks that actually ran. Count the
+# verdict lines of the offline gate ("  OK  ...") and the boot test ("OK: ...")
+# in the build log - a PASS without them means the gate did not run.
+sed -e 's/<[^>]*>//g' "$WORK/log.html" > "$WORK/log.txt"
+gate_ok=$(grep -cE '^[[:space:]]+OK[[:space:]]' "$WORK/log.txt" || true)
+boot_ok=$(grep -cE '^OK: ' "$WORK/log.txt" || true)
+fails=$(grep -cE '^[[:space:]]*FAIL[:[:space:]]' "$WORK/log.txt" || true)
+echo "   offline gate: $gate_ok OK, boot test: $boot_ok OK, FAIL lines: $fails"
+grep -E '^OK: ' "$WORK/log.txt" | sed 's/^/   /'
+if [ "$gate_ok" -lt 20 ] || [ "$boot_ok" -lt 5 ] || [ "$fails" -gt 0 ]; then
+  echo "PASS without evidence: too few check results in the build log"; exit 1
+fi
 echo "== build PASS"
 
 # --- artifact published and downloadable -----------------------------------------
