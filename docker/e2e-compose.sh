@@ -108,7 +108,7 @@ done
 # verdict lines of the offline gate ("  OK  ...") and the boot test ("OK: ...")
 # in the FULL build log (the GUI page shows only its tail) - a PASS without
 # them means the gate did not run. Thresholds sit below what a debian-13 build
-# produces (19 gate / 9 boot-test results on 2026-11-14).
+# produces (67 gate / 9 boot-test results on 2026-11-14).
 dc exec -T factory sh -c 'cat /srv/cs-factory/work/build/logs/1.log' \
   | sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' > "$WORK/log.txt"
 gate_ok=$(grep -cE '^[[:space:]]+OK[[:space:]]' "$WORK/log.txt" || true)
@@ -116,7 +116,7 @@ boot_ok=$(grep -cE '^OK: ' "$WORK/log.txt" || true)
 fails=$(grep -cE '^[[:space:]]*FAIL[:[:space:]]' "$WORK/log.txt" || true)
 echo "   offline gate: $gate_ok OK, boot test: $boot_ok OK, FAIL lines: $fails"
 grep -E '^OK: ' "$WORK/log.txt" | sed 's/^/   /'
-if [ "$gate_ok" -lt 15 ] || [ "$boot_ok" -lt 5 ] || [ "$fails" -gt 0 ]; then
+if [ "$gate_ok" -lt 50 ] || [ "$boot_ok" -lt 8 ] || [ "$fails" -gt 0 ]; then
   echo "PASS without evidence: too few check results in the build log"; exit 1
 fi
 echo "== build PASS"
