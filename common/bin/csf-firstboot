@@ -1,0 +1,40 @@
+#!/bin/bash
+# OS update on first boot. Does not block boot (oneshot AFTER multi-user.target and
+# cloud-final). Scope: fixes WITHIN the current release, no major version change
+# (dnf: --security first; apt: `upgrade --with-new-pkgs`; zypper: patch).
+# The flag is created only after a SUCCESSFUL update — a failed one is retried on the
+# next boot. The permanent patch path is the distribution's native mechanism
+# (unattended-upgrades / dnf-automatic / os-update), enabled in the template.
+set -uo pipefail
+FLAG=/var/lib/csf/firstboot.done
+[ -e "$FLAG" ] && exit 0
+
+ok=1
+if command -v dnf >/dev/null 2>&1; then
+  dnf -y --security upgrade || dnf -y upgrade || ok=0
+elif command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  # `--with-new-pkgs`, not plain `upgrade`. A kernel update on Debian/Ubuntu is a NEW
+  # package (new ABI in the name), required by the `linux-image-*` meta package.
+  # Plain `apt-get upgrade` does not install new packages, so the kernel is silently
+  # "held back" (a stable-security kernel update was observed NOT installed after
+  # firstboot). `--with-new-pkgs` adds new dependencies but removes nothing (unlike
+  # dist-upgrade).
+  # Lock::Timeout: automatic apt updates are enabled in the template and may be
+  # holding the dpkg lock right now — wait instead of failing immediately.
+  APT=(apt-get -y -o DPkg::Lock::Timeout=600
+       -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+  { "${APT[@]}" update && "${APT[@]}" --with-new-pkgs upgrade; } || ok=0
+elif command -v zypper >/dev/null 2>&1; then
+  export ZYPP_LOCK_TIMEOUT=600
+  zypper -n patch || zypper -n update || ok=0
+fi
+
+if [ "$ok" = 1 ]; then
+  touch "$FLAG"
+else
+  # exit 0 on purpose: a machine without network access must not sit in `degraded`
+  # state because of a unit the tenant does not know. The trace stays in the journal.
+  echo "csf-firstboot: update FAILED — will retry on next boot" >&2
+fi
+exit 0

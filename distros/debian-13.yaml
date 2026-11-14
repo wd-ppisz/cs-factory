@@ -1,0 +1,28 @@
+name: "Debian 13"
+# "current" policy: URL points at latest/, integrity from upstream SHA512SUMS on
+# every download; cache refreshed after 90 days (build.sh).
+url: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+sums_url: "https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS"
+cs_ostype: "Debian GNU/Linux 12 (64-bit)"  # CloudStack 4.22 has no 'Debian 13' type yet — closest available
+epel: false
+# CloudStack password in a VPC with a redundant VR. cloud-init looks for the password
+# server first by the name `data-server`, and when that does not resolve it takes
+# SERVER_ADDRESS from the DHCP lease, i.e. the router's OWN address. The systemvm
+# password server listens on the VIP (gateway) only, so the password never arrives.
+# `data-server` resolves only through the DHCP search domain, and Debian 13 ships
+# networkd with upstream UseDomains=no. Ubuntu 26.04 carries UseDomains=true in its
+# image; Rocky and openSUSE use NetworkManager, which takes the DHCP domain by itself.
+# The [Network] UseDomains key in networkd.conf requires systemd >= 256 — hence a
+# flag, not a common file: on Debian 12 (252) and Ubuntu 22.04/24.04 (249/255)
+# networkd would log "Unknown key" and change nothing.
+# The validate-offline.sh gate requires UseDomains=true on EVERY image with networkd
+# and systemd >= 256 — a forgotten flag in a new distribution shows up in CI.
+networkd_use_domains: true
+disk_size: "10G"
+packages:
+  - qemu-guest-agent
+  - fail2ban
+  - chrony
+  - curl
+  - jq
+  - python3

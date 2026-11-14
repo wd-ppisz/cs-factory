@@ -1,0 +1,30 @@
+[Unit]
+Description=cs-factory first-boot OS update
+ConditionPathExists=!/var/lib/csf/firstboot.done
+Wants=network-online.target
+# `After=multi-user.target` is MANDATORY, not cosmetic.
+# A target adds `After=` on every unit it wants (WantedBy) for itself, UNLESS that
+# unit is itself explicitly `After=` the target. Without this line there is a loop:
+#   multi-user.target → (After) csf-firstboot → (After) cloud-final.service
+#   → (After) multi-user.target
+# because `cloud-final.service` (and `cloud-init.target`) has `After=multi-user.target`
+# on Debian 12/13, openSUSE Leap 16 and Rocky 10. systemd breaks such a loop by
+# deleting ONE of the jobs — a different one on every boot. Observed on a tenant
+# machine: first boot "Job cloud-final.service/start deleted to break ordering cycle"
+# (user-data and cloud-init's final stage did not run at all, `cloud-init status` =
+# running forever), second boot — csf-firstboot dropped. Smoke-boot let it through,
+# because a single boot can land on the "good" half of the draw.
+# With an explicit `After=multi-user.target` the unit starts AFTER the target is
+# reached — matching the intent "does not block boot" (same pattern as csf-inspect).
+After=network-online.target multi-user.target cloud-final.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/csf-firstboot
+# The flag is set ONLY by the script, and only after a successful update. The old
+# `ExecStartPost=/bin/touch …` set it after every run, so a failed update (no network,
+# dpkg lock held) was never retried.
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

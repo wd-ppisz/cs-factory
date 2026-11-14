@@ -1,0 +1,14 @@
+[DEFAULT]
+# ignoreip: loopback plus 169.254.0.0/16 = CloudStack link-local control network
+# (VR password server). Add your administrative/bastion networks at build time with
+# CSF_FAIL2BAN_IGNOREIP (build.sh replaces this whole line), so fail2ban never bans
+# your own support path.
+# Keep ignoreip on a SINGLE line — build.sh rewrites it with a line-based sed.
+ignoreip = 127.0.0.1/8 ::1 169.254.0.0/16
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+backend  = systemd
+
+[sshd]
+enabled = true

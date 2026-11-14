@@ -1,0 +1,15 @@
+name: "Ubuntu 26.04"
+# Added as a manifest-only commit — the child pipeline builds it automatically,
+# without editing the CI config.
+url: "https://cloud-images.ubuntu.com/releases/resolute/release/ubuntu-26.04-server-cloudimg-amd64.img"
+sums_url: "https://cloud-images.ubuntu.com/releases/resolute/release/SHA256SUMS"
+cs_ostype: "Ubuntu 24.04 LTS"  # CloudStack 4.22 has no 'Ubuntu 26.04' type yet — closest available
+epel: false
+disk_size: "10G"
+packages:
+  - qemu-guest-agent
+  - fail2ban
+  - chrony
+  - curl
+  - jq
+  - python3

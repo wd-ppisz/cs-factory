@@ -1,0 +1,8 @@
+cs-factory
+Copyright The cs-factory Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It builds virtual machine templates from upstream cloud images published by
+their respective distributions; those images and the packages installed into
+them are distributed under their own licenses and are not part of this project.

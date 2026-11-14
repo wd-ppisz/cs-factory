@@ -1,0 +1,16 @@
+name: "Rocky 8"
+# "current" policy: .latest variant + per-file .CHECKSUM (BSD format
+# "SHA256 (file) = hash" — the parser in build.sh handles it).
+url: "https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud-Base.latest.x86_64.qcow2"
+sums_url: "https://dl.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud-Base.latest.x86_64.qcow2.CHECKSUM"
+cs_ostype: "Rocky Linux 8"   # exists in CloudStack 4.22 — exact match
+epel: true            # fail2ban is in EPEL; epel-release is in the Rocky extras repo
+disk_size: "10G"
+packages:
+  - qemu-guest-agent
+  - fail2ban
+  - fail2ban-systemd  # backend=systemd; python3-systemd comes from BaseOS
+  - chrony
+  - curl
+  - jq
+  - python3

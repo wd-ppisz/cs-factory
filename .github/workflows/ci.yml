@@ -1,0 +1,174 @@
+# cs-factory - CI on GitHub Actions.
+#
+#   dev   - syntax (bash -n, py_compile), shellcheck, manifest lint, unit tests of
+#           the CVE controller and the GUI. Fast feedback for every push and PR.
+#   test  - code scanners: secrets (gitleaks), secrets + misconfiguration (trivy fs)
+#           with a positive control, Python SAST (bandit, blocks HIGH/HIGH).
+#           BLOCKING: a red scanner fails the workflow.
+#
+# Template builds (libguestfs/KVM) and the host CVE controller are NOT run here:
+# they need the factory host itself (self-hosted runner) - see README.md.
+#
+# TODO pin-by-sha: third-party actions and container images are pinned to version
+# tags; replace them with full commit SHAs / image digests after verifying them.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TRIVY_IMAGE: aquasec/trivy:0.67.0
+  GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.21.2
+  BANDIT_VERSION: "1.8.6"
+
+jobs:
+  dev:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4  # TODO pin-by-sha
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5  # TODO pin-by-sha
+        with:
+          python-version: "3.12"
+
+      - name: Shell syntax
+        run: |
+          bash -n build.sh register.sh common/finalize.sh common/bin/csf-firstboot \
+            common/bin/csf-watchdog e2e/smoke-boot.sh e2e/validate-offline.sh \
+            e2e/tier2-cloudstack.sh ci/factory-deploy.sh gui/install.sh
+          sh -n ci/factory_inventory.sh ci/gen-child.sh
+
+      - name: shellcheck
+        run: |
+          command -v shellcheck >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+          shellcheck --version
+          shellcheck -S warning build.sh register.sh common/finalize.sh common/bin/csf-firstboot \
+            common/bin/csf-watchdog e2e/smoke-boot.sh e2e/validate-offline.sh e2e/tier2-cloudstack.sh \
+            ci/factory-deploy.sh ci/factory_inventory.sh gui/install.sh
+
+      - name: Python syntax
+        run: |
+          python -m py_compile common/bin/cloudcfg-tune.py common/bin/csf-inspect \
+            e2e/mock-vr/beacon-server.py e2e/qga-probe.py e2e/probe-ds-cloudstack.py \
+            e2e/tier3-features.py gui/app.py gui/cs.py gui/test_app.py \
+            ci/cve_controller.py ci/test_cve_controller.py
+
+      - name: Manifest lint
+        run: |
+          for m in distros/*.yaml; do
+            grep -q '^name:' "$m" || { echo "manifest without name: $m"; exit 1; }
+            grep -q '^url:'  "$m" || { echo "manifest without url: $m"; exit 1; }
+            grep -q '^packages:' "$m" || { echo "manifest without packages: $m"; exit 1; }
+            # integrity: either the upstream checksum file ("current" policy) or a pinned sha
+            grep -q '^sums_url:' "$m" || grep -Eq '^sha(256|512): "[0-9a-f]{64,128}"' "$m" \
+              || { echo "manifest without sums_url and without a checksum: $m"; exit 1; }
+            # minimum 10G disk - also enforced in build.sh and in validate-offline
+            d=$(grep -E '^disk_size:' "$m" | sed -E 's/.*"([0-9]+)([GM])".*/\1\2/')
+            case "$d" in
+              *G) [ "${d%G}" -ge 10 ] || { echo "manifest with disk < 10G: $m ($d)"; exit 1; } ;;
+              *M) echo "manifest with disk < 10G: $m ($d)"; exit 1 ;;
+              *)  echo "manifest without a valid disk_size: $m"; exit 1 ;;
+            esac
+            for p in qemu-guest-agent fail2ban; do
+              grep -Eq "^[[:space:]]*-[[:space:]]*$p([[:space:]]|#|\$)" "$m" \
+                || { echo "manifest without mandatory package $p: $m"; exit 1; }
+            done
+          done
+          # Templates serve tenant VMs: the common layer must never disable the
+          # distribution's automatic security updates.
+          if grep -rInE 'Unattended-Upgrade[[:space:]]+"0"|systemctl[[:space:]]+mask[[:space:]].*apt-daily' common/ build.sh \
+               | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(#|//)'; then
+            echo "the common layer disables automatic apt updates - tenant templates must keep them enabled"; exit 1
+          fi
+
+      - name: CVE controller unit tests
+        run: python -m unittest -v ci/test_cve_controller.py
+
+      - name: GUI unit tests
+        run: |
+          python -m pip install --disable-pip-version-check -q flask authlib requests
+          python -m unittest -v gui/test_app.py
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4  # TODO pin-by-sha
+        with:
+          persist-credentials: false
+
+      # Secrets in the working tree. --redact keeps secret values out of the log.
+      - name: Secret scan (gitleaks)
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" "$GITLEAKS_IMAGE" \
+            dir /repo --redact --no-banner --exit-code 1
+          # positive control: a random token in GitHub PAT format, created on the fly
+          K="$(mktemp -d)"
+          printf 'token = "ghp_%s"\n' "$(head -c 600 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 36)" > "$K/canary.env"
+          if docker run --rm -v "$K:/canary:ro" "$GITLEAKS_IMAGE" dir /canary --redact --no-banner --exit-code 1 >/dev/null 2>&1; then
+            echo "POSITIVE CONTROL FAILED: gitleaks did not detect the canary - the secret scanner is not working"; exit 1
+          fi
+          rm -rf "$K"; echo "positive control OK: canary detected"
+
+      # The gate is the DIRECT scan with --exit-code, not `trivy convert --exit-code`
+      # on a JSON report: convert does not know which scanners were enabled and
+      # checks nothing. The positive control proves the secret scanner can go red.
+      - name: Trivy fs (secret, misconfig)
+        run: |
+          trivy() { docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" "$@"; }
+          trivy --version
+          trivy fs --skip-version-check --scanners secret,misconfig --format json --output trivy-fs.json .
+          trivy fs --skip-version-check --scanners secret,misconfig --severity HIGH,CRITICAL --exit-code 1 --format table .
+          K="$(mktemp -d)"
+          printf 'token = "ghp_%s"\n' "$(head -c 600 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 36)" > "$K/canary.env"
+          if docker run --rm -v "$K:/canary:ro" "$TRIVY_IMAGE" fs -q --skip-version-check --scanners secret --exit-code 1 /canary >/dev/null 2>&1; then
+            echo "POSITIVE CONTROL FAILED: trivy did not detect the canary - the secret scanner is not working"; exit 1
+          fi
+          rm -rf "$K"; echo "positive control OK: canary detected"
+
+      - uses: actions/setup-python@v5  # TODO pin-by-sha
+        with:
+          python-version: "3.12"
+
+      # Python SAST (GUI, controller, e2e probes). Full report at all levels to
+      # the artifact; blocks HIGH severity at HIGH confidence.
+      - name: Bandit
+        env:
+          PY: >-
+            gui/app.py gui/cs.py ci/cve_controller.py common/bin/cloudcfg-tune.py
+            common/bin/csf-inspect e2e/qga-probe.py e2e/probe-ds-cloudstack.py
+            e2e/tier3-features.py e2e/mock-vr/beacon-server.py
+        run: |
+          python -m pip install --disable-pip-version-check -q "bandit==$BANDIT_VERSION"
+          bandit --version
+          # shellcheck disable=SC2086
+          bandit -f json -o bandit.json $PY || true
+          # shellcheck disable=SC2086
+          bandit -f screen $PY || true
+          # shellcheck disable=SC2086
+          bandit --severity-level high --confidence-level high $PY
+
+      - name: Upload scan reports
+        if: always()
+        uses: actions/upload-artifact@v4  # TODO pin-by-sha
+        with:
+          name: scan-reports
+          path: |
+            trivy-fs.json
+            bandit.json
+          retention-days: 30
+          if-no-files-found: ignore

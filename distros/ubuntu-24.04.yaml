@@ -1,0 +1,15 @@
+name: "Ubuntu 24.04"
+# "current" policy: releases/noble/release/ = symlink to the newest build;
+# SHA256SUMS next to it (format "hash *file" — the parser in build.sh handles it).
+url: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img"
+sums_url: "https://cloud-images.ubuntu.com/releases/noble/release/SHA256SUMS"
+cs_ostype: "Ubuntu 24.04 LTS"
+epel: false
+disk_size: "10G"
+packages:
+  - qemu-guest-agent
+  - fail2ban
+  - chrony
+  - curl
+  - jq
+  - python3

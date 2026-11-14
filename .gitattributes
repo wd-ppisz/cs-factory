@@ -1,0 +1,5 @@
+# Everything LF - scripts and configs from this repo are copied INTO Linux images
+# (virt-customize --copy-in); CRLF in /usr/local/sbin/* = a broken service.
+* text=auto eol=lf
+*.qcow2 binary
+*.img binary

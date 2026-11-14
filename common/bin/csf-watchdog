@@ -1,0 +1,59 @@
+#!/bin/sh
+# cs-factory: watchdog layer — the i6300esb driver for the RUNNING kernel.
+#
+# Two jobs, both driven by observed defects, not by caution:
+#  1. an explicit `modprobe` — Ubuntu kernel packages ship
+#     /usr/lib/modprobe.d/blacklist_linux_<ABI>.conf with `blacklist i6300esb`, which
+#     blocks loading BY ALIAS, i.e. exactly the path udev uses to load the driver by
+#     the PCI ID of the device CloudStack adds. `modprobe <name>` does not apply the
+#     blacklist (only `-b` does, which udev uses). Ubuntu 26.04 had both the driver
+#     file and the PCI alias in the image, yet in the guest neither the module nor
+#     /dev/watchdog0;
+#  2. restoring the package after a kernel ABI change — on Ubuntu the driver lives in
+#     `linux-modules-extra-<ABI>`, which the `linux-image-virtual` meta does NOT pull.
+#     The only meta that would (`linux-image-generic`) requires `linux-firmware`:
+#     +624 MB (noble) / +1089 MB (jammy) to the image. So the factory installs the
+#     VERSIONED package, and after an ABI bump (unattended-upgrades / csf-firstboot)
+#     the new one would not arrive by itself and the watchdog would expire SILENTLY.
+#     The template therefore restores this driver by itself.
+#
+# The script NEVER exits with an error: the tenant's machine must not sit in `degraded`
+# state because of a unit the tenant does not know (same choice as in csf-firstboot).
+# The trace stays in the journal, and the effect is gated by tests: the driver file in
+# the image — e2e/validate-offline.sh, actual arming — e2e/smoke-boot.sh (live boot
+# with `-device i6300esb`) and e2e/tier3-features.py (a machine in CloudStack).
+set -u
+MOD=i6300esb
+KVER="$(uname -r)"
+
+if modprobe "$MOD" 2>/dev/null; then
+  exit 0
+fi
+
+if ! command -v apt-get >/dev/null 2>&1; then
+  echo "csf-watchdog: no $MOD driver for kernel $KVER; non-apt family — check the image variant" >&2
+  exit 0
+fi
+
+PKG="linux-modules-extra-$KVER"
+echo "csf-watchdog: no $MOD driver for kernel $KVER — installing $PKG" >&2
+export DEBIAN_FRONTEND=noninteractive
+# DPkg::Lock::Timeout: automatic updates are ENABLED in the template and may be holding
+# the dpkg lock right now — wait instead of failing immediately (same pattern as
+# csf-firstboot). Package indexes in the image may be older than the kernel, so on
+# failure retry after `update`.
+APT="apt-get -y -o DPkg::Lock::Timeout=600"
+if $APT install "$PKG" >/dev/null 2>&1 \
+   || { $APT update >/dev/null 2>&1 && $APT install "$PKG" >/dev/null 2>&1; }; then
+  if modprobe "$MOD" 2>/dev/null; then
+    echo "csf-watchdog: $PKG installed, driver $MOD loaded" >&2
+  else
+    echo "csf-watchdog: $PKG installed, but modprobe $MOD still refuses" >&2
+  fi
+else
+  # No network / package not in the repository: do not force anything here — the
+  # attempt repeats on next boot, and meanwhile the machine works normally (the
+  # watchdog is platform supervision, not a requirement for the system to run).
+  echo "csf-watchdog: could not install $PKG (no network or no package) — will retry on next boot" >&2
+fi
+exit 0

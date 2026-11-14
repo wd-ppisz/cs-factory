@@ -1,0 +1,36 @@
+name: "Rocky 10"
+# "current" policy: .latest variant + per-file .CHECKSUM (BSD format
+# "SHA256 (file) = hash" — the parser in build.sh handles it).
+url: "https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2"
+sums_url: "https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2.CHECKSUM"
+cs_ostype: "Rocky Linux 9"  # CloudStack 4.22 has no 'Rocky Linux 10' type yet — closest available
+epel: true            # fail2ban is in EPEL 10; epel-release is in Rocky extras
+disk_size: "10G"
+packages:
+  - qemu-guest-agent
+  - fail2ban
+  - fail2ban-systemd  # backend=systemd; python3-systemd comes from BaseOS
+  - chrony
+  - curl
+  - jq
+  - python3
+# Instances from this template could not be reached over SSH in CloudStack.
+# cloud-init 24.4-7.el10.0.1 from the base image calls `dhcpcd --dumplease` in
+# `DataSourceCloudStack._get_domainname()` (the only DHCP client in the image; there
+# is no dhclient in BaseOS, AppStream or EPEL 10), gets "dhcpcd is not running" —
+# the network is managed by NetworkManager — and an unhandled `NoDHCPLeaseError`
+# aborts the WHOLE init stage: no host keys (sshd FAILED), authorized_keys, user-data
+# or password.
+# The fix is upstream patch d2bf883931 (#6554, report #6679), backported by Red Hat
+# to cloud-init-24.4-7.el10_2.1 (RHEL-159033) and available in Rocky 10 AppStream.
+# The GenericCloud base image is older, and `install` does not upgrade a package that
+# is already present — so we upgrade it explicitly. It is the VENDOR's patch, not
+# ours: later updates on the instance will not revert it, and `rpm -V` stays clean.
+# Residual risk (deliberately out of scope, upstream #6838): `get_vr_address()` in the
+# datasource constructor still guards `dhcp_client.get_newest_lease` against
+# FileNotFoundError only. If the name `data-server` did NOT resolve (a network without
+# DNS from the VR), Rocky 10 would end up without a datasource, while Rocky 9 and
+# openSUSE (dhclient) would fall back to the gateway. Where the VR provides the domain,
+# `data-server` = VIP — the tier3 test requires this from every distribution.
+upgrade_packages:
+  - cloud-init

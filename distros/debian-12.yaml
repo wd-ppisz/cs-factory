@@ -1,0 +1,22 @@
+name: "Debian 12"
+# "current" policy: URL points at latest/, integrity from upstream SHA512SUMS on
+# every download; cache refreshed after 90 days (build.sh).
+#
+# The `generic` variant, NOT `genericcloud` — the only one in the family. Reason
+# (found by the tier3 test): Debian 12's `cloud` kernel does NOT include the
+# `i6300esb` driver, so the watchdog layer has nothing to drive — empty `lsmod`,
+# no /dev/watchdog0, while systemd still reports RuntimeWatchdogSec=30s, i.e. it
+# looks green. Debian 13 has the module in its `cloud` kernel and works as is.
+# Cost: a 427 MB image instead of 330 MB.
+url: "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
+sums_url: "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS"
+cs_ostype: "Debian GNU/Linux 12 (64-bit)"   # exists in CloudStack 4.22 — exact match
+epel: false
+disk_size: "10G"
+packages:
+  - qemu-guest-agent
+  - fail2ban
+  - chrony
+  - curl
+  - jq
+  - python3

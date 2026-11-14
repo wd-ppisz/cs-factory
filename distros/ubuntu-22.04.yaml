@@ -1,0 +1,36 @@
+name: "Ubuntu 22.04"
+# "current" policy: releases/jammy/release/ = symlink to the newest build;
+# SHA256SUMS next to it (format "hash *file" — the parser in build.sh handles it).
+url: "https://cloud-images.ubuntu.com/releases/jammy/release/ubuntu-22.04-server-cloudimg-amd64.img"
+sums_url: "https://cloud-images.ubuntu.com/releases/jammy/release/SHA256SUMS"
+cs_ostype: "Ubuntu 22.04 LTS"   # exists in CloudStack 4.22 — no approximate mapping
+epel: false
+# Root is grown ALREADY AT BUILD TIME — otherwise the watchdog driver does not fit.
+# The jammy image root partition is 2.0 GiB, and after the factory packages only
+# ~104 MB is left (`df -h /` inside virt-customize on the source image). Kernel 5.15
+# keeps modules UNCOMPRESSED, so `linux-modules-extra-5.15.0-*-generic` takes ~353 MB —
+# dpkg aborted unpacking with "No space left on device" (gate: "kernel ... WITHOUT the
+# i6300esb driver"). 24.04 (.ko.zst, ~107 MB) and 26.04 (module in linux-modules) are
+# not affected.
+# A bigger `disk_size` alone does NOT help: the build changes only the disk size, and
+# the partition is grown by cloud-init on first boot — on an image copy grown to 10G
+# root was still 2.0 GiB. Ext4 with root as the last partition (layout 14 15 1), so
+# growing in place changes neither UUID nor numbering (unlike Rocky 10's XFS).
+grow_root_at_build: true
+disk_size: "10G"
+packages:
+  - qemu-guest-agent
+  - fail2ban
+  - chrony
+  - curl
+  - jq
+  - python3
+# CloudStack password in a VPC with a redundant VR.
+# Jammy ships `isc-dhcp-client`, and cloud-init 26.1 can read the lease of the
+# ephemeral dhclient — so `DataSourceCloudStackLocal` SUCCEEDS in init-local and takes
+# the VR address from `dhcp-server-identifier` (the address of ONE router) instead of
+# from the name `data-server` (VIP), which cannot be resolved in init-local.
+# The systemvm password server listens on the VIP only → "Failed to fetch password
+# from virtual router" and the deploy/reset password never reaches /etc/shadow.
+# The flag moves datasource detection to init-network (as on 24.04/26.04).
+cloudstack_datasource_network: true

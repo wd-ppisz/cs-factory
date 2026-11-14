@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""cs-factory read-only inspection agent (virtio-serial, out-of-band).
+
+Fixed, read-only command set: snapshot | psi | topio | topnet.
+No guest-exec, no file access. Channel: /dev/virtio-ports/org.csfactory.support.0
+"""
+import collections
+import json
+import os
+import threading
+import time
+
+PORT = "/dev/virtio-ports/org.csfactory.support.0"
+PSI = collections.deque(maxlen=180)   # ~15 min @ 5s
+
+
+def psi():
+    o = {}
+    for r in ("cpu", "io", "memory"):
+        try:
+            o[r] = open(f"/proc/pressure/{r}").read().strip()
+        except OSError:
+            o[r] = None
+    return o
+
+
+def top_io(n=10):
+    res = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            io = {l.split(":")[0]: int(l.split()[1]) for l in open(f"/proc/{pid}/io")}
+            comm = open(f"/proc/{pid}/comm").read().strip()
+            res.append([io.get("write_bytes", 0) + io.get("read_bytes", 0), pid, comm])
+        except OSError:
+            pass
+    return sorted(res, reverse=True)[:n]
+
+
+def net():
+    def rd(p, d=""):
+        try:
+            return open(p).read().strip()
+        except OSError:
+            return d
+    return {
+        "est": os.popen("ss -tun state established 2>/dev/null | wc -l").read().strip(),
+        "conntrack": rd("/proc/sys/net/netfilter/nf_conntrack_count"),
+        "dev": rd("/proc/net/dev"),
+    }
+
+
+def snapshot():
+    return {
+        "ts": time.time(),
+        "load": open("/proc/loadavg").read().split()[:3],
+        "psi_now": psi(),
+        "psi_hist": list(PSI)[-24:],
+        "top_io": top_io(),
+        "net": net(),
+    }
+
+
+CMDS = {"snapshot": snapshot, "psi": psi, "topio": top_io, "topnet": net}
+
+
+def sampler():
+    while True:
+        PSI.append([time.time(), psi()])
+        time.sleep(5)
+
+
+def main():
+    threading.Thread(target=sampler, daemon=True).start()
+    while True:
+        try:
+            ch = open(PORT, "r+")
+        except OSError:
+            time.sleep(5)          # channel not attached yet
+            continue
+        try:
+            for line in ch:
+                fn = CMDS.get(line.strip())
+                ch.write(json.dumps(fn() if fn else {"err": "unknown"}) + "\n")
+                ch.flush()
+        except OSError:
+            time.sleep(2)
+        finally:
+            try:
+                ch.close()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    main()

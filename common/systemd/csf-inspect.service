@@ -1,0 +1,16 @@
+[Unit]
+Description=cs-factory read-only inspection agent
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/local/sbin/csf-inspect
+Restart=always
+RestartSec=5
+# The agent must not become a noisy neighbour itself:
+CPUQuota=5%
+MemoryMax=64M
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
